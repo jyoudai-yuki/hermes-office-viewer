@@ -1699,6 +1699,178 @@ function OfficeCard({ path, label }) {
   })
 }
 
+/* ─────────── 双击接管工作台文件树（fork 补丁 · dblclick-interceptor-v1） ─────────── */
+
+/**
+ * 上游没有这个能力，本段是本 fork 加的。原委：
+ *
+ * core 把工作台文件树的双击硬绑在 `right-sidebar/files/tree.tsx` → `previewFile()` →
+ * `lib/local-preview.ts`，而那条链只认 html / image / pdf，其余一律 `previewKind:'text'`，
+ * 于是 .docx 在官方预览器里是乱码。SDK 目前也没有「文件预览器」扩展点（全部扩展点是
+ * panes / routes / sidebar.nav / statusBar / titleBar / palette / keybinds / themes /
+ * composer.* / transcript.directives / layouts），所以只能在捕获阶段把这次手势截下来，
+ * 转成本插件自己的约定事件 `hermes-office-open`，由本插件在右列渲染。
+ *
+ * 与上游的耦合面只有「事件名」一处：不调用任何内部函数，上游重构内部实现不影响本补丁。
+ * 失效表现是退化而非破坏：core 改掉 `[data-project-tree]` 或行上的 `title` 属性后拦不住，
+ * 双击回到官方预览器，不会更坏。
+ *
+ * 上游落地 FILE_PREVIEW_AREA 后应删掉本段，改用官方扩展点。
+ */
+export const PATCH_DBLCLICK = 'dblclick-interceptor-v1'
+
+/**
+ * 只拦「本插件渲染得明显比 core 好」的格式，列表按**内核真实能力**取（ENGINE_EXTS），
+ * 不按 README 那张表取：README 声称支持的 odt / ods / docm / xlsm / pps / tsv / iWork /
+ * epub / 邮件 等并没有接进内核分派，拦过来只会落到查看器的「不支持」分支，比 core 的
+ * 文本预览更差。
+ *
+ * md 是刻意加的例外：core 只把它当纯文本显示，本插件的 marked 渲染更好。
+ * 图片 / PDF / HTML / 纯文本与代码一概放过，core 自己能处理，不抢。
+ */
+export const TREE_INTERCEPT_EXTS = [...ENGINE_EXTS, 'md', 'markdown', 'mdx']
+
+/** 这个路径是否值得从 core 手里截下来。 */
+export function isInterceptablePath(path) {
+  const lower = String(path || '').toLowerCase()
+
+  return TREE_INTERCEPT_EXTS.some(ext => lower.endsWith(`.${ext}`))
+}
+
+/**
+ * 双击行 → 绝对路径。core 的行元素 `title={node.data.id}`（绝对路径），容器是
+ * `[data-project-tree]`；占位行用 `parent::placeholder` 形式的 id，明确拒掉。
+ * 这是读 core 的标记，所以写得保守：认不出来一律返回 ''，把手势还给 core。
+ */
+export function treePathFromTarget(target) {
+  if (!target || typeof target.closest !== 'function') {
+    return ''
+  }
+
+  const row = target.closest('[data-project-tree] [title]')
+
+  if (!row || typeof row.getAttribute !== 'function') {
+    return ''
+  }
+
+  const raw = String(row.getAttribute('title') || '').trim()
+
+  if (!raw || raw.includes('::') || !raw.startsWith('/')) {
+    return ''
+  }
+
+  return isInterceptablePath(raw) ? raw : ''
+}
+
+/** 手势目标的现场描述，只用于诊断文案与「没接住」的通知。 */
+export function describeTreeTarget(target) {
+  const el = target && typeof target.closest === 'function' ? target : null
+  const inTree = !!(el && el.closest('[data-project-tree]'))
+  const titled = el && el.closest('[title]')
+
+  return { inTree, title: titled ? String(titled.getAttribute('title') || '') : '' }
+}
+
+/** 一个手势该不该被我们接管（纯函数，便于测试钉边界）。 */
+export function judgeTreeGesture(target, mods) {
+  const info = describeTreeTarget(target)
+  const path = treePathFromTarget(target)
+
+  if (mods && (mods.altKey || mods.ctrlKey || mods.metaKey)) {
+    return { path, info, reason: '修饰键 → 放行给官方', take: false }
+  }
+
+  if (!path) {
+    return {
+      path: '',
+      info,
+      reason: info.inTree ? '树内但不是接管格式' : '不在工作台文件树内',
+      take: false
+    }
+  }
+
+  return { path, info, reason: '已拦截并转给本插件', take: true }
+}
+
+/** 把路径交给本插件的约定事件（见 EXTERNAL_OPEN_EVENT）。 */
+export function forwardToViewer(path) {
+  const w = globalThis.window
+  const EventCtor = globalThis.CustomEvent
+
+  if (!w || typeof w.dispatchEvent !== 'function' || typeof EventCtor !== 'function') {
+    return false
+  }
+
+  w.dispatchEvent(new EventCtor(EXTERNAL_OPEN_EVENT, { detail: { path } }))
+
+  return true
+}
+
+function swallowGesture(event) {
+  if (typeof event.preventDefault === 'function') event.preventDefault()
+  if (typeof event.stopPropagation === 'function') event.stopPropagation()
+  if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation()
+}
+
+/** 一次手势只开一次：第二次单击与 dblclick 都会到，core 两边都可能响应。 */
+let _lastTreeOpen = { path: '', at: 0 }
+
+function openTreePath(path, label, info) {
+  const now = Date.now()
+
+  if (_lastTreeOpen.path === path && now - _lastTreeOpen.at < 900) {
+    return false
+  }
+
+  _lastTreeOpen = { path, at: now }
+  beacon('tree-open', `${label} | ${path} | inTree=${info ? info.inTree : '?'}`)
+  forwardToViewer(path)
+
+  return true
+}
+
+/**
+ * 捕获阶段拦第二次单击。core 是通过 react-arborist 的 click 处理激活预览的
+ * （`onActivate` 在 click 与 dblclick 上都会触发），所以等 dblclick 到的时候官方预览
+ * 已经开了。第一次单击放过，行仍能正常选中。
+ */
+function onTreeClickCapture(event) {
+  const verdict = judgeTreeGesture(event && event.target, event)
+
+  if (!verdict.take || (event.detail || 1) < 2) {
+    return
+  }
+
+  swallowGesture(event)
+  openTreePath(verdict.path, '已拦截（第二次单击）', verdict.info)
+}
+
+/** 兜底：万一激活确实是 dblclick 驱动的。同时在这里报「没接住」。 */
+function onTreeDoubleClick(event) {
+  const verdict = judgeTreeGesture(event && event.target, event)
+
+  if (verdict.take) {
+    if ((event.detail || 2) < 2) {
+      return
+    }
+
+    swallowGesture(event)
+    openTreePath(verdict.path, '已拦截（双击）', verdict.info)
+
+    return
+  }
+
+  beacon('tree-miss', `${verdict.reason} | ${verdict.path || verdict.info.title}`)
+
+  // 「看着能渲染却没接住」是 core 标记变了才会出现的信号，值得打扰用户一次。
+  if (!verdict.path && isInterceptablePath(verdict.info.title)) {
+    host.notify({
+      kind: 'error',
+      message: `没接住这个文件：${verdict.info.title}（${verdict.info.inTree ? '树内标记未识别' : '不在文件树内'}）`
+    })
+  }
+}
+
 /* ─────────────────────────── 注册 ─────────────────────────── */
 
 export default {
@@ -1716,6 +1888,11 @@ export default {
     window.removeEventListener(EXTERNAL_OPEN_EVENT, onExternalOpenRequest)
     window.addEventListener(EXTERNAL_OPEN_EVENT, onExternalOpenRequest)
     ctx.onDispose?.(() => window.removeEventListener(EXTERNAL_OPEN_EVENT, onExternalOpenRequest))
+
+    // fork 补丁 · dblclick-interceptor-v1：工作台文件树的双击（capture 阶段）。
+    // 上游没有这个能力，理由与失效表现见 TREE_INTERCEPT_EXTS 上方那段注释。
+    ctx.addEventListener(document, 'click', onTreeClickCapture, true)
+    ctx.addEventListener(document, 'dblclick', onTreeDoubleClick, true)
 
     ctx.registerMany([
       {
